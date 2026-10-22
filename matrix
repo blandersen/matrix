@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Lightweight terminal digital rain with incremental redraw. Quit with q or Ctrl-C.
+
+set -u
+
+prog=${0##*/}
+density=100
+speed_scale=1
+color=green
+chars='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@#$%&*+-='
+katakana='ｦｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789'
+use_katakana=0
+
+color_names=(green cyan blue magenta red yellow white)
+color_codes=(32 36 34 35 31 33 37)
+
+usage() {
+  cat <<HELP
+Usage: $prog [options]
+
+Options:
+  -d, --density PERCENT    Rain coverage from 0 to 100 (default: 100)
+  -s, --speed MULTIPLIER   Speed up the default rain by 1 to 5 (default: 1)
+  -c, --color COLOR        green, cyan, blue, magenta, red, yellow, or white
+                           (default: green)
+      --chars STRING       Characters used for the rain (printable ASCII)
+                           (default: 0-9, A-Z, a-z, and @#\$%&*+-=)
+  -k, --katakana           Use half-width katakana and digits
+  -h, --help               Show this help
+
+Keys:
+  q          quit
+  p, space   pause / resume
+  + / -      faster / slower
+  c          cycle color
+
+Examples:
+  $prog --density 45
+  $prog --speed 2 --color cyan
+  $prog --katakana
+HELP
+}
+
+error() {
+  printf '%s: %s\n' "$prog" "$1" >&2
+  printf 'Try --help for usage.\n' >&2
+  exit 2
+}
+
+while (($#)); do
+  case $1 in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -d|--density)
+      (($# >= 2)) || error 'missing value for --density'
+      [[ $2 =~ ^[0-9]+$ ]] || error 'density must be an integer from 0 to 100'
+      density=$2
+      (( density <= 100 )) || error 'density must be an integer from 0 to 100'
+      shift 2
+      ;;
+    -s|--speed)
+      (($# >= 2)) || error 'missing value for --speed'
+      [[ $2 =~ ^[0-9]+$ ]] || error 'speed must be an integer from 1 to 5'
+      speed_scale=$2
+      (( speed_scale >= 1 && speed_scale <= 5 )) || error 'speed must be an integer from 1 to 5'
+      shift 2
+      ;;
+    -c|--color)
+      (($# >= 2)) || error 'missing value for --color'
+      color=$2
+      shift 2
+      ;;
+    --chars|--characters)
+      (($# >= 2)) || error 'missing value for --chars'
+      chars=$2
+      shift 2
+      ;;
+    -k|--katakana)
+      use_katakana=1
+      shift
+      ;;
+    *)
+      error "unknown option: $1"
+      ;;
+  esac
+done
+
+color_index=-1
+for ((i = 0; i < ${#color_names[@]}; i++)); do
+  [[ $color == "${color_names[i]}" ]] && color_index=$i
+done
+(( color_index >= 0 )) || error 'color must be green, cyan, blue, magenta, red, yellow, or white'
+
+(( ${#chars} > 0 )) || error 'character list cannot be empty'
+(( ${#chars} <= 256 )) || error 'character list is limited to 256 characters'
+# Only accept printable ASCII so custom characters cannot send terminal control sequences.
+for ((i = 0; i < ${#chars}; i++)); do
+  char=${chars:i:1}
+  printf -v char_code '%d' "'$char"
+  (( char_code >= 32 && char_code <= 126 )) || error 'character list must contain printable ASCII characters only'
+done
+
+if (( use_katakana )); then
+  probe='ｱ'
+  (( ${#probe} == 1 )) || error '--katakana needs a UTF-8 locale (e.g. LANG=en_US.UTF-8)'
+  chars=$katakana
+fi
+char_count=${#chars}
+
+if [[ ! -t 1 ]]; then
+  printf '%s: run this in an interactive terminal.\n' "$prog" >&2
+  exit 1
+fi
+
+rows=$(tput lines 2>/dev/null || printf '24')
+cols=$(tput cols 2>/dev/null || printf '80')
+[[ $rows =~ ^[0-9]+$ ]] || rows=24
+[[ $cols =~ ^[0-9]+$ ]] || cols=80
+(( rows > 100 )) && rows=100
+(( cols > 180 )) && cols=180
+(( rows < 1 )) && rows=24
+(( cols < 1 )) && cols=80
+
+dim_len=3                       # oldest trail cells drawn dim
+mutations=$(( cols / 10 + 1 ))  # random trail glyph swaps per frame
+esc=$'\033['
+
+set_colors() {
+  head_sgr="${esc}0;1;97m"
+  body_sgr="${esc}0;${color_codes[color_index]}m"
+  dim_sgr="${esc}0;2;${color_codes[color_index]}m"
+}
+set_colors
+
+# Drop state per column. Head moves vel*speed_scale/4 rows per frame (fixed point in acc).
+declare -a head trail vel acc active head_glyph
+spawn() {
+  head[$1]=$(( -(RANDOM % 15) - 1 ))
+  trail[$1]=$(( RANDOM % 11 + 5 ))
+  vel[$1]=$(( RANDOM % 7 + 2 ))
+  acc[$1]=0
+  head_glyph[$1]=' '
+}
+for ((x = 0; x < cols; x++)); do
+  if (( density == 100 )) || (( RANDOM % 100 < density )); then
+    active[x]=1
+    spawn "$x"
+    head[x]=$(( -(RANDOM % rows) - 1 ))  # stagger initial entry
+  else
+    active[x]=0
+  fi
+done
+
+# stdin tty: read with VTIME=1 is both the 0.1 s frame delay and the key poll.
+interactive=0
+if [[ -t 0 ]]; then
+  interactive=1
+  saved_stty=$(stty -g)
+  stty -icanon -echo min 0 time 1
+fi
+
+cleanup() {
+  (( interactive )) && stty "$saved_stty"
+  printf '\033[0m\033[2J\033[H\033[?25h'
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
+printf '\033[0m\033[2J\033[H\033[?25l'
+paused=0
+
+while :; do
+  if (( interactive )); then
+    key=''
+    read -r key
+    for ((k = 0; k < ${#key}; k++)); do
+      case ${key:k:1} in
+        q|Q) exit 0 ;;
+        p|P|' ') paused=$(( !paused )) ;;
+        +|=) (( speed_scale < 5 )) && speed_scale=$(( speed_scale + 1 )) ;;
+        -|_) (( speed_scale > 1 )) && speed_scale=$(( speed_scale - 1 )) ;;
+        c|C) color_index=$(( (color_index + 1) % ${#color_names[@]} )); set_colors ;;
+      esac
+    done
+  else
+    sleep 0.1
+  fi
+  (( paused )) && continue
+
+  out=''
+  for ((x = 0; x < cols; x++)); do
+    (( active[x] )) || continue
+    acc[x]=$(( acc[x] + vel[x] * speed_scale ))
+    steps=$(( acc[x] / 4 ))
+    acc[x]=$(( acc[x] % 4 ))
+    col=$(( x + 1 ))
+    t=${trail[x]}
+    while (( steps-- > 0 )); do
+      h=$(( head[x] + 1 ))
+      head[x]=$h
+      # Previous head settles to body color, new head is bright.
+      (( h >= 1 && h <= rows )) && out+="${esc}${h};${col}H${body_sgr}${head_glyph[x]}"
+      if (( h >= 0 && h < rows )); then
+        glyph=${chars:RANDOM%char_count:1}
+        head_glyph[x]=$glyph
+        out+="${esc}$(( h + 1 ));${col}H${head_sgr}${glyph}"
+      fi
+      # Cell entering the dim tail, then the cell leaving the trail.
+      y=$(( h - t + dim_len ))
+      (( y >= 0 && y < rows )) && out+="${esc}$(( y + 1 ));${col}H${dim_sgr}${chars:RANDOM%char_count:1}"
+      y=$(( h - t ))
+      (( y >= 0 && y < rows )) && out+="${esc}$(( y + 1 ));${col}H "
+      if (( y >= rows - 1 )); then
+        spawn "$x"
+        break
+      fi
+    done
+  done
+
+  # Swap a few lit trail glyphs; the head is excluded.
+  for ((m = 0; m < mutations; m++)); do
+    x=$(( RANDOM % cols ))
+    (( active[x] )) || continue
+    h=${head[x]}
+    t=${trail[x]}
+    lo=$(( h - t + 1 ))
+    hi=$(( h - 1 ))
+    (( lo < 0 )) && lo=0
+    (( hi >= rows )) && hi=$(( rows - 1 ))
+    (( hi >= lo )) || continue
+    y=$(( lo + RANDOM % (hi - lo + 1) ))
+    if (( y <= h - t + dim_len )); then sgr=$dim_sgr; else sgr=$body_sgr; fi
+    out+="${esc}$(( y + 1 ));$(( x + 1 ))H${sgr}${chars:RANDOM%char_count:1}"
+  done
+
+  printf '%s' "$out"
+done
